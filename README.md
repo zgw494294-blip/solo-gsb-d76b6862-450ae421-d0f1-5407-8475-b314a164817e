@@ -58,6 +58,15 @@
   整批回滚）、查询与分叉不影响记录，**新分支不继承记录**。记录仅存内存且不计入样本容量；
   撤销与同会话其他操作串行，查询不会看到部分恢复。未知会话 `404`，无可撤销记录 `409`，
   成功返回 `200` 与原会话查询格式。
+- **SSE 快照订阅**：`GET /sessions/{sid}/stream` 以 `text/event-stream` 持续推送会话快照，
+  无需轮询。每帧是一个 `snapshot` 事件，data 为 JSON：`revision`（从 0 开始、严格递增的会话
+  版本号）与 `state`（完整快照：原会话查询字段、按序号排列的存活样本、全部片段详情、模式及
+  命中留样配置与命中结果）。**首帧是订阅时刻同一时刻的完整快照**，此后每次成功修改（写入、
+  撤销、触发、删除片段、调参、配置模式、启用留样；**整批写入只推进一次**）各推一帧完整快照，
+  衔接不漏掉其间更新；查询、失败请求与作为分叉来源不推进版本，**新分支的 revision 从 0 开始**，
+  **撤销不回退 revision**，帧中严格递增且不含批内或回滚前状态。每个订阅最多缓存一条待发快照
+  （新帧替换旧帧即合并中间更新），**停止修改后继续读取必收到最新状态**；慢订阅者不阻塞采样，
+  网络发送不占会话锁，断连即释放订阅。未知会话在建流前返回 `404`，不提供历史重放。
 
 ## 启动
 
@@ -89,6 +98,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
 | POST | `/sessions/{sid}/samples/batch` | 成组批量写入 1～100 个整数样本：整批接收或整批拒绝，超容返回 `409` 与首个失败项的 `index` |
 | POST | `/sessions/{sid}/undo` | 撤销最近一次成功的单条或整批写入，返回会话状态（无可撤销记录返回 `409`） |
+| GET | `/sessions/{sid}/stream` | SSE 订阅会话快照流：每帧 `snapshot` 事件含 `revision` 与完整 `state`（未知会话 `404`） |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
 | GET | `/sessions/{sid}/pattern/hits` | 查询累计命中数与最近 100 次命中的 `start_seq`/`end_seq` |
 | POST | `/sessions/{sid}/hit-fragments/enable` | 启用命中留样：每次模式命中自动生成 `completed` 留样片段（每会话一次） |
@@ -798,6 +808,64 @@ curl -s -X POST http://localhost:8000/sessions/15/triggers \
 
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/15/undo
 # 409   —— 成功触发已使撤销记录失效
+```
+
+### 21. SSE 订阅：一个终端订阅，另一终端写入与撤销
+
+终端 A 创建会话并用 `curl -N`（禁用输出缓冲，事件实时到达）订阅快照流：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}'
+# {"session_id":16,"history":2,"capacity":3}
+
+curl -N http://localhost:8000/sessions/16/stream
+```
+
+立即收到首帧——订阅时刻同一时刻的完整快照，`revision` 从 0 开始：
+
+```
+event: snapshot
+data: {"revision":0,"state":{"session_id":16,"history":2,"capacity":3,"next_seq":1,"used":0,"stored_seqs":[],"fragments":[],"samples":[],"fragment_details":[],"pattern":{"configured":false,"pattern":null,"hit_fragments_enabled":false,"hit_count":0,"recent_hits":[]}}}
+```
+
+终端 B 依次写入两条样本、再撤销一次：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/16/samples \
+  -H 'Content-Type: application/json' -d '{"value": 10}'
+# {"seq":1,"value":10}
+curl -s -X POST http://localhost:8000/sessions/16/samples \
+  -H 'Content-Type: application/json' -d '{"value": 20}'
+# {"seq":2,"value":20}
+curl -s -X POST http://localhost:8000/sessions/16/undo
+# {"session_id":16,"history":2,"capacity":3,"next_seq":2,"used":1,"stored_seqs":[1],"fragments":[]}
+```
+
+终端 A 依次收到三帧：每次成功修改各推一帧完整快照，`revision` 严格递增；
+撤销也推进 `revision`（`state` 回到写入前，但 `revision` 不回退）：
+
+```
+event: snapshot
+data: {"revision":1,"state":{"session_id":16,...,"next_seq":2,"used":1,"stored_seqs":[1],...,"samples":[{"seq":1,"value":10}],...}}
+
+event: snapshot
+data: {"revision":2,"state":{"session_id":16,...,"next_seq":3,"used":2,"stored_seqs":[1,2],...,"samples":[{"seq":1,"value":10},{"seq":2,"value":20}],...}}
+
+event: snapshot
+data: {"revision":3,"state":{"session_id":16,...,"next_seq":2,"used":1,"stored_seqs":[1],...,"samples":[{"seq":1,"value":10}],...}}
+```
+
+每帧 `state` 都是完整快照：原会话查询字段（`history`/`capacity`/`next_seq`/`used`/
+`stored_seqs`/`fragments`）、按序号排列的存活样本 `samples`、全部片段详情
+`fragment_details`（含各片段样本与状态）、模式及命中留样配置与命中结果 `pattern`。
+后续写入、触发、删除、调参、配置模式、启用留样都会各推一帧（整批写入只推一帧）；
+查询、失败请求与作为分叉来源不推帧。`Ctrl-C` 断开 `curl` 即释放订阅；
+未知会话在建流前返回 `404`，不提供历史重放：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/sessions/99/stream
+# 404
 ```
 
 ## 本地开发（可选）

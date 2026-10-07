@@ -44,14 +44,27 @@ completed 片段（center=命中末条序号、before=模式长度减 1、after=
 继续。成功触发、删除片段、调参、配置模式或启用留样使记录失效；失败请求、
 查询与分叉不影响记录，新分支不继承记录。记录仅存内存且不计入样本容量；
 撤销在会话锁内一次完成，与同会话其他操作串行，查询不会看到部分恢复。
+
+SSE 快照订阅：GET /sessions/{sid}/stream 以 text/event-stream 持续推送会话
+快照，无需轮询。每帧为 snapshot 事件，data 是含 revision 与 state 的 JSON；
+state 含原会话查询字段、按序号排列的存活样本、全部片段详情、模式及命中
+留样配置与命中结果。会话 revision 从 0 开始，成功写入、撤销、触发、删除
+片段、调参、配置模式与启用留样各加 1（整批写入只加 1）；查询、失败请求
+与作为分叉来源不加，新分支从 0 开始；撤销不回退 revision，帧中严格递增，
+不含批内或回滚前状态。首帧为订阅时刻同一时刻的完整快照，后续帧也是完整
+快照；订阅注册与首帧构造在会话锁内一次完成，衔接不漏掉其间更新。每个
+订阅最多缓存一条待发快照（新帧替换旧帧即合并中间更新），停止修改后继续
+读取必收到最新状态；发布只是锁内非阻塞入队，慢订阅者不阻塞采样，网络
+发送不占会话锁，断连即释放订阅。未知会话建流前返回 404，不提供历史重放。
 """
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import deque
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 app = FastAPI(title="sample-fragment-service", version="1.0.0")
@@ -232,6 +245,11 @@ class Session:
         # 仅存内存、不计入样本容量；成功触发/删除片段/调参/配置模式/
         # 启用留样后失效，分叉不继承
         self.undo_snapshot: dict | None = None
+        # SSE 订阅：会话版本号（从 0 开始，成功修改单调递增，撤销不回退）
+        # 与订阅者队列集合（每订阅最多缓存一条待发快照）；分叉不复制，
+        # 新分支 revision 从 0 开始、无订阅者
+        self.revision = 0
+        self.subscribers: set[asyncio.Queue] = set()
         self.lock = asyncio.Lock()
 
     # ---- 容量核算 ----
@@ -292,6 +310,7 @@ class Session:
         self.reclaim()
         # 调参成功使撤销记录失效（校验失败已在上面抛 409，记录不变）
         self.undo_snapshot = None
+        self._bump()
 
     # ---- 模式识别 ----
 
@@ -305,6 +324,7 @@ class Session:
         self.matcher = PatternMatcher(self.pattern)
         self.pattern_configured = True
         self.undo_snapshot = None  # 配置模式使撤销记录失效
+        self._bump()
 
     def enable_hit_fragments(self) -> None:
         """启用命中留样；每会话一次，条件不满足均抛 409 且不改变任何状态。
@@ -323,6 +343,7 @@ class Session:
             raise _conflict("模式长度超过样本容量 C，无法启用命中留样")
         self.preserve_hits = True
         self.undo_snapshot = None  # 启用留样使撤销记录失效
+        self._bump()
 
     def observe(self, seq: int, value: int) -> None:
         """样本成功提交后喂入自动机；命中则追加记录（与写样本同一串行临界区）。"""
@@ -348,10 +369,12 @@ class Session:
         saved_record = self.undo_snapshot
         self.undo_snapshot = self._snapshot_state()
         try:
-            return self._write(value)
+            seq = self._write(value)
         except HTTPException:
             self.undo_snapshot = saved_record
             raise
+        self._bump()  # 成功写入推进版本；失败请求不推进
+        return seq
 
     def _write(self, value: int) -> int:
         """单条写入的核心逻辑：容量核算、提交与识别（不含撤销记录管理）。"""
@@ -426,6 +449,8 @@ class Session:
             self.undo_snapshot = saved_record
             raise BatchConflictError(len(seqs) + 1, str(exc.detail)) from exc
         self.undo_snapshot = snapshot
+        # 整批只推进一次版本：批内中间状态与回滚前状态都不会出现在任何帧中
+        self._bump()
         return seqs
 
     # ---- 撤销记录 ----
@@ -466,6 +491,7 @@ class Session:
             raise _conflict("没有可撤销的写入记录")
         self._restore_state(snap)
         self.undo_snapshot = None
+        self._bump()  # 撤销推进版本：revision 不随撤销回退，帧中严格递增
 
     def trigger(self, before: int, after: int) -> Fragment:
         """以当前末条为中心创建片段；历史不足时抛 409。"""
@@ -486,10 +512,20 @@ class Session:
         self.fragments[frag.fragment_id] = frag
         self.next_fragment_id += 1
         self.undo_snapshot = None  # 成功触发使撤销记录失效
+        self._bump()
         return frag
 
     def status_of(self, frag: Fragment) -> str:
         return "completed" if frag.end < self.next_seq else "pending"
+
+    def delete_fragment(self, fragment_id: int) -> None:
+        """删除片段并立刻回收不再被任何一方需要的样本；片段不存在抛 404。"""
+        if self.fragments.pop(fragment_id, None) is None:
+            raise HTTPException(status_code=404, detail="片段不存在")
+        # 解除引用后立刻回收不再被任何一方需要的样本
+        self.reclaim()
+        self.undo_snapshot = None  # 删除片段使撤销记录失效
+        self._bump()
 
     # ---- 分叉 ----
 
@@ -524,6 +560,56 @@ class Session:
         # 命中留样启用状态一并复制；临时前缀随自动机 state 已拷贝，各支此后独立
         child.preserve_hits = self.preserve_hits
         return child
+
+    # ---- SSE 快照订阅 ----
+
+    def _bump(self) -> None:
+        """成功修改会话后推进版本并发布快照；须在会话锁内、状态已定型后调用。
+
+        成功写入、撤销、触发、删除片段、调参、配置模式与启用留样各调一次
+        （整批写入只在整批成功后调一次）；查询、失败请求与作为分叉来源
+        不调用，故 revision 不含批内或回滚前状态，也不随撤销回退。
+        """
+        self.revision += 1
+        self._publish()
+
+    def _publish(self) -> None:
+        """把当前完整快照非阻塞地投给全部订阅者（在会话锁内调用）。
+
+        每个订阅队列最多缓存一条待发快照：队列已满时丢弃旧帧、替换为最新
+        帧——快照是完整状态，替换即合并中间更新，且停止修改后继续读取必
+        收到最新状态。入队一律 put_nowait，慢订阅者永不阻塞采样；真正的
+        网络发送由 SSE 响应在会话锁外完成，不占会话锁。
+        """
+        if not self.subscribers:
+            return
+        frame = _snapshot_frame(self)
+        for queue in list(self.subscribers):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        """注册一个订阅并返回其队列；须在会话锁内调用。
+
+        首帧（锁内同一时刻的完整快照）立即入队，此后每次成功修改各投一帧；
+        注册与首帧构造在同一临界区完成，故首帧与后续帧之间不会漏掉更新。
+        不提供历史重放：首帧即订阅时刻的状态。
+        """
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait(_snapshot_frame(self))
+        self.subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        """移除订阅（断连时调用，释放订阅资源）。"""
+        self.subscribers.discard(queue)
 
 
 # ---------------- 会话注册表（单进程内存） ----------------
@@ -580,6 +666,36 @@ def _fragment_detail(sess: Session, frag: Fragment) -> dict:
     }
 
 
+def _snapshot_frame(sess: Session) -> dict:
+    """一帧 SSE 快照：revision + 完整 state（在会话锁内构造，对应同一时刻）。
+
+    state 含原会话查询字段（GET /sessions/{sid} 的全部字段）、按序号升序的
+    存活样本、全部未删除片段的详情（含各片段样本），以及模式配置、命中留样
+    启用状态与命中结果（累计命中数与最近 100 次命中）。
+    """
+    return {
+        "revision": sess.revision,
+        "state": {
+            **_session_summary(sess),
+            "samples": [
+                {"seq": seq, "value": sess.samples[seq]}
+                for seq in sorted(sess.samples)
+            ],
+            "fragment_details": [
+                _fragment_detail(sess, sess.fragments[fid])
+                for fid in sorted(sess.fragments)
+            ],
+            "pattern": {
+                "configured": sess.pattern_configured,
+                "pattern": sess.pattern,
+                "hit_fragments_enabled": sess.preserve_hits,
+                "hit_count": sess.hit_count,
+                "recent_hits": list(sess.recent_hits),
+            },
+        },
+    }
+
+
 # ---------------- HTTP 接口 ----------------
 
 @app.get("/")
@@ -601,6 +717,54 @@ async def get_session(session_id: int) -> dict:
     sess = _get_session(session_id)
     async with sess.lock:
         return _session_summary(sess)
+
+
+@app.get("/sessions/{session_id}/stream")
+async def stream_session(session_id: int, request: Request) -> StreamingResponse:
+    """以 SSE 持续推送会话快照，无需轮询。
+
+    每帧是一个 `snapshot` 事件，data 为 JSON：`revision`（从 0 开始、严格递增的
+    会话版本号）与 `state`（完整快照：原会话查询字段、按序号排列的存活样本、
+    全部片段详情、模式及命中留样配置与命中结果）。首帧是订阅时刻同一时刻的
+    完整快照，此后每次成功修改（写入、撤销、触发、删除片段、调参、配置模式、
+    启用留样；整批写入只算一次）各推一帧完整快照，衔接不漏掉其间更新；查询、
+    失败请求与作为分叉来源不推进版本，新分支的 revision 从 0 开始，撤销不回退
+    revision。每个订阅最多缓存一条待发快照，中间更新可被合并，但停止修改后
+    继续读取必收到最新状态；慢订阅者不阻塞采样，发送不占会话锁，断连即释放
+    订阅。会话不存在在建流前返回 404；不提供历史重放。
+    """
+    sess = _get_session(session_id)  # 未知会话：建流前 404
+    async with sess.lock:
+        # 注册与首帧构造在会话锁内完成，与后续修改的发布衔接不漏
+        queue = sess.subscribe()
+
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    frame = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # 空闲保活并探测断连（注释行不是 snapshot 事件帧）
+                    if await request.is_disconnected():
+                        break
+                    yield ": keep-alive\n\n"
+                    continue
+                # 发送在会话锁外进行，慢端不阻塞采样
+                yield "event: snapshot\ndata: " + json.dumps(
+                    frame, ensure_ascii=False, separators=(",", ":")
+                ) + "\n\n"
+        finally:
+            sess.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/sessions/{session_id}/fork", status_code=201)
@@ -756,8 +920,4 @@ async def get_fragment(session_id: int, fragment_id: int) -> dict:
 async def delete_fragment(session_id: int, fragment_id: int) -> None:
     sess = _get_session(session_id)
     async with sess.lock:
-        if sess.fragments.pop(fragment_id, None) is None:
-            raise HTTPException(status_code=404, detail="片段不存在")
-        # 解除引用后立刻回收不再被任何一方需要的样本
-        sess.reclaim()
-        sess.undo_snapshot = None  # 删除片段使撤销记录失效
+        sess.delete_fragment(fragment_id)
